@@ -19,9 +19,20 @@ const (
 	baseURL = "https://www.fotmob.com/api"
 )
 
-// ActiveLeagues returns the league IDs to use for API calls.
-// This respects user settings - if specific leagues are selected, only those are returned.
-// If no selection is made, returns all supported leagues.
+// CaptureActiveLeagues takes a one-time normalized snapshot of the active
+// league IDs for a query round. Every batch and per-league request in that
+// round must use the returned snapshot instead of re-reading settings, so an
+// external settings change mid-query cannot make one round mix two league
+// sets. An empty selection is resolved to the default leagues by the data
+// layer. Load errors are returned alongside the default fallback.
+func CaptureActiveLeagues() ([]int, error) {
+	return data.LoadActiveLeagueIDs()
+}
+
+// ActiveLeagues returns the normalized active league IDs, falling back to the
+// default leagues when settings cannot be loaded. Prefer
+// CaptureActiveLeagues at the start of a query round so the load error stays
+// visible; this convenience is for callers that only need the current set.
 func ActiveLeagues() []int {
 	return data.ActiveLeagueIDs()
 }
@@ -137,24 +148,35 @@ func (c *Client) MatchesByDate(ctx context.Context, date time.Time) ([]api.Match
 // MatchesByDateWithTabs retrieves matches for a specific date, querying only specified tabs.
 // tabs can be: ["fixtures"], ["results"], or ["fixtures", "results"]
 // This allows optimizing API calls - e.g., only query "results" for past days.
-// Results are cached per date (cache key includes all tabs for that date).
+// A normalized league snapshot is captured once for the whole call; use
+// MatchesByDateWithTabsForLeagues when the caller already owns a snapshot
+// (e.g. a multi-day query round) so every day covers exactly the same leagues.
 func (c *Client) MatchesByDateWithTabs(ctx context.Context, date time.Time, tabs []string) ([]api.Match, error) {
+	leagueIDs, err := CaptureActiveLeagues()
+	if err != nil {
+		c.debugLog("matches: active league snapshot load failed, using default fallback", "err", err)
+	}
+	return c.MatchesByDateWithTabsForLeagues(ctx, date, tabs, leagueIDs)
+}
+
+// MatchesByDateWithTabsForLeagues runs the aggregated date query against an
+// explicit, caller-owned league snapshot. No settings are read during the
+// query, so an external preference change cannot alter which leagues a round
+// covers. Results are cached under a composite key (league set + date +
+// status tabs), keeping different preferences and tab combinations isolated.
+func (c *Client) MatchesByDateWithTabsForLeagues(ctx context.Context, date time.Time, tabs []string, leagueIDs []int) ([]api.Match, error) {
 	// Normalize date to UTC for consistent comparison
 	requestDateStr := date.UTC().Format("2006-01-02")
 
-	// Check cache first (only if querying both tabs - full cache)
-	if len(tabs) == 2 {
-		if cached := c.cache.Matches(requestDateStr); cached != nil {
-			return cached, nil
-		}
+	// Composite key isolates league selection, date, and requested statuses.
+	cacheKey := BuildMatchesCacheKey(leagueIDs, requestDateStr, tabs)
+	if cached := c.cache.Matches(cacheKey); cached != nil {
+		return cached, nil
 	}
-
-	// Get active leagues (respects user settings)
-	activeLeagues := ActiveLeagues()
 
 	// Use a mutex to protect the shared slice
 	var mu sync.Mutex
-	allMatches := make([]api.Match, 0, len(activeLeagues)*5)
+	allMatches := make([]api.Match, 0, len(leagueIDs)*5)
 
 	// Query leagues concurrently - no stagger delays, just rate limiting
 	// Best-effort aggregation: if a league query fails, we skip it and continue with others
@@ -178,8 +200,10 @@ func (c *Client) MatchesByDateWithTabs(ctx context.Context, date time.Time, tabs
 		}
 	}
 
-	// Query each league by fetching its page (the old /api/leagues JSON endpoint is gone)
-	for _, leagueID := range activeLeagues {
+	// Query each league in the fixed snapshot by fetching its page (the old
+	// /api/leagues JSON endpoint is gone). The snapshot is never re-read, so
+	// all goroutines in this round cover the same league set.
+	for _, leagueID := range leagueIDs {
 		// Check empty cache before spawning goroutine
 		if wantFinished && !wantLive && !wantNotStarted && c.emptyCache != nil && c.emptyCache.IsEmpty(requestDateStr, leagueID) {
 			skippedFromCache++
@@ -293,8 +317,10 @@ func (c *Client) MatchesByDateWithTabs(ctx context.Context, date time.Time, tabs
 
 	wg.Wait()
 
-	// Cache the results before returning
-	c.cache.SetMatches(requestDateStr, allMatches)
+	// Cache the results under the composite key before returning. Isolation
+	// by league set + date + status means this entry can never be served to a
+	// query with different preferences or different requested statuses.
+	c.cache.SetMatches(cacheKey, allMatches)
 
 	// Persist empty results cache to disk (best-effort)
 	_ = c.SaveEmptyCache()

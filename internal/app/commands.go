@@ -23,14 +23,13 @@ const LiveBatchSize = 4
 
 // fetchLiveBatchData fetches live matches for a batch of leagues concurrently.
 // batchIndex: 0, 1, 2, ... (each batch fetches LiveBatchSize leagues in parallel)
+// leagueSnapshot is the normalized league set captured once when the query
+// round started; the batch's league IDs and isLast are derived from it, so the
+// round never re-reads settings and cannot mix league sets mid-loading.
 // Results appear after each batch completes, giving progressive updates while being fast.
-func fetchLiveBatchData(parentCtx context.Context, client *fotmob.Client, useMockData bool, batchIndex int) tea.Cmd {
+func fetchLiveBatchData(parentCtx context.Context, client *fotmob.Client, useMockData bool, batchIndex int, leagueSnapshot []int) tea.Cmd {
 	return func() tea.Msg {
-		totalLeagues := fotmob.TotalLeagues()
-		startIdx := batchIndex * LiveBatchSize
-		endIdx := startIdx + LiveBatchSize
-		endIdx = min(endIdx, totalLeagues)
-		isLast := endIdx >= totalLeagues
+		batchLeagues, isLast := fotmob.BatchLeagueIDs(leagueSnapshot, batchIndex, LiveBatchSize)
 
 		// Check if cancelled before starting work
 		if parentCtx.Err() != nil {
@@ -67,19 +66,18 @@ func fetchLiveBatchData(parentCtx context.Context, client *fotmob.Client, useMoc
 		// the user's UTC midnight still surface here.
 		var wg sync.WaitGroup
 		var mu sync.Mutex
-		allLive := make([]api.Match, 0, (endIdx-startIdx)*5)
-		allUpcoming := make([]api.Match, 0, (endIdx-startIdx)*5)
+		allLive := make([]api.Match, 0, len(batchLeagues)*5)
+		allUpcoming := make([]api.Match, 0, len(batchLeagues)*5)
 
-		for i := startIdx; i < endIdx; i++ {
+		for _, leagueID := range batchLeagues {
 			wg.Add(1)
-			go func(leagueIdx int) {
+			go func(id int) {
 				defer wg.Done()
 
-				leagueID := fotmob.LeagueIDAtIndex(leagueIdx)
 				ctx, cancel := context.WithTimeout(parentCtx, 10*time.Second)
 				defer cancel()
 
-				live, upcoming, err := client.LiveAndUpcomingForLeague(ctx, leagueID)
+				live, upcoming, err := client.LiveAndUpcomingForLeague(ctx, id)
 				if err != nil {
 					return
 				}
@@ -91,7 +89,7 @@ func fetchLiveBatchData(parentCtx context.Context, client *fotmob.Client, useMoc
 				allLive = append(allLive, live...)
 				allUpcoming = append(allUpcoming, upcoming...)
 				mu.Unlock()
-			}(i)
+			}(leagueID)
 		}
 
 		wg.Wait()
@@ -248,8 +246,11 @@ func fetchPollMatchDetails(client *fotmob.Client, matchID int, useMockData bool)
 // fetchStatsDayData fetches stats data for a single day (progressive loading).
 // dayIndex: 0 = today, 1 = yesterday, etc.
 // totalDays: total number of days to fetch (for isLast calculation)
+// leagueSnapshot is the fixed normalized league set for the whole round; the
+// day request is scoped to that snapshot so an external settings edit while
+// the multi-day load is in flight cannot change which leagues later days cover.
 // This enables showing results immediately as each day's data arrives.
-func fetchStatsDayData(parentCtx context.Context, client *fotmob.Client, useMockData bool, dayIndex int, totalDays int) tea.Cmd {
+func fetchStatsDayData(parentCtx context.Context, client *fotmob.Client, useMockData bool, dayIndex int, totalDays int, leagueSnapshot []int) tea.Cmd {
 	return func() tea.Msg {
 		isToday := dayIndex == 0
 		isLast := dayIndex == totalDays-1
@@ -300,10 +301,10 @@ func fetchStatsDayData(parentCtx context.Context, client *fotmob.Client, useMock
 
 		if isToday {
 			// Today: need both fixtures (upcoming) and results (finished)
-			matches, err = client.MatchesByDateWithTabs(ctx, date, []string{"fixtures", "results"})
+			matches, err = client.MatchesByDateWithTabsForLeagues(ctx, date, []string{"fixtures", "results"}, leagueSnapshot)
 		} else {
 			// Past days: only need results (finished matches)
-			matches, err = client.MatchesByDateWithTabs(ctx, date, []string{"results"})
+			matches, err = client.MatchesByDateWithTabsForLeagues(ctx, date, []string{"results"}, leagueSnapshot)
 		}
 
 		if err != nil {

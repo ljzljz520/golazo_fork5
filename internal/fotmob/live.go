@@ -122,13 +122,26 @@ func matchTitles(matches []api.Match) []string {
 }
 
 // LiveAndUpcoming fetches live and upcoming matches across all active leagues
-// concurrently using the status-only classifier. Best-effort aggregation: a
-// league that errors is skipped, the rest still return.
+// concurrently using the status-only classifier. The active league snapshot is
+// captured exactly once for the whole round; use LiveAndUpcomingForLeagues
+// when the caller already owns a snapshot. Best-effort aggregation: a league
+// that errors is skipped, the rest still return.
 func (c *Client) LiveAndUpcoming(ctx context.Context) (live, upcoming []api.Match, err error) {
-	activeLeagues := ActiveLeagues()
+	leagueIDs, snapshotErr := CaptureActiveLeagues()
+	if snapshotErr != nil {
+		c.debugLog("live: active league snapshot load failed, using default fallback", "err", snapshotErr)
+	}
+	return c.LiveAndUpcomingForLeagues(ctx, leagueIDs)
+}
+
+// LiveAndUpcomingForLeagues runs the live/upcoming aggregation against an
+// explicit caller-owned league snapshot. No settings are read while the
+// queries run, so an external preference change cannot make a round cover a
+// different league set than the one it started with.
+func (c *Client) LiveAndUpcomingForLeagues(ctx context.Context, leagueIDs []int) (live, upcoming []api.Match, err error) {
 	var mu sync.Mutex
 	var wg sync.WaitGroup
-	for _, leagueID := range activeLeagues {
+	for _, leagueID := range leagueIDs {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
@@ -149,18 +162,21 @@ func (c *Client) LiveAndUpcoming(ctx context.Context) (live, upcoming []api.Matc
 	return live, upcoming, nil
 }
 
-// TotalLeagues returns the number of active leagues (respects user settings).
-func TotalLeagues() int {
-	return len(ActiveLeagues())
-}
-
-// LeagueIDAtIndex returns the league ID at the given index from active leagues.
-func LeagueIDAtIndex(index int) int {
-	activeLeagues := ActiveLeagues()
-	if index < 0 || index >= len(activeLeagues) {
-		return 0
+// BatchLeagueIDs slices a fixed league snapshot into one progressive-loading
+// batch. It is a pure function of the snapshot: batch count, batch boundaries,
+// and isLast are all derived from the snapshot taken at query start, so
+// repeated settings reads can never make batches within a round diverge.
+// Returns an empty slice (with isLast == true) for an out-of-range index.
+func BatchLeagueIDs(snapshot []int, batchIndex, batchSize int) (ids []int, isLast bool) {
+	if batchSize <= 0 || batchIndex < 0 {
+		return nil, true
 	}
-	return activeLeagues[index]
+	start := batchIndex * batchSize
+	if start >= len(snapshot) {
+		return nil, true
+	}
+	end := min(start+batchSize, len(snapshot))
+	return snapshot[start:end], end >= len(snapshot)
 }
 
 // LiveUpdateParser parses match events into live update strings.

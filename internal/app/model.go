@@ -89,6 +89,13 @@ type model struct {
 	liveTotalBatches    int         // Total batches to load
 	liveMatchesBuffer   []api.Match // Buffer to accumulate live matches during progressive load
 	liveUpcomingBuffer  []api.Match // Buffer to accumulate upcoming matches during progressive load
+	// liveLeagueSnapshot is the normalized league set captured once when the
+	// live-view query round starts. Batch count and every batch's league IDs
+	// are derived from it, so settings changes mid-loading cannot mix league
+	// sets within the same round.
+	liveLeagueSnapshot []int
+	// statsLeagueSnapshot plays the same role for the multi-day stats round.
+	statsLeagueSnapshot []int
 
 	// UI components
 	spinner          spinner.Model

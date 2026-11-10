@@ -274,16 +274,18 @@ func TestResponseCache_MatchDetails(t *testing.T) {
 func TestResponseCache_Matches(t *testing.T) {
 	cache := NewResponseCache(DefaultCacheConfig())
 
+	key := BuildMatchesCacheKey([]int{47, 87}, "2026-03-10", []string{"fixtures", "results"})
+
 	// Miss
-	if got := cache.Matches("2026-03-10"); got != nil {
+	if got := cache.Matches(key); got != nil {
 		t.Error("expected nil for cache miss")
 	}
 
 	// Set and hit
 	matches := []api.Match{{ID: 1}, {ID: 2}}
-	cache.SetMatches("2026-03-10", matches)
+	cache.SetMatches(key, matches)
 
-	got := cache.Matches("2026-03-10")
+	got := cache.Matches(key)
 	if got == nil {
 		t.Fatal("expected cache hit")
 	}

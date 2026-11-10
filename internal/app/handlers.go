@@ -90,14 +90,29 @@ func (m model) handleMainViewKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.statsDaysLoaded = 0                      // Reset progress
 			m.statsTotalDays = fotmob.StatsDataDays    // Set total days to load
 			m.statsMatchesList.SetItems([]list.Item{}) // Clear list
+			// Fix the league snapshot for the whole round: every day's request
+			// uses this exact set, even if settings change while loading.
+			statsSnapshot, snapshotErr := fotmob.CaptureActiveLeagues()
+			if snapshotErr != nil {
+				m.debugLog(fmt.Sprintf("stats snapshot load failed, using fallback: %v", snapshotErr))
+			}
+			m.statsLeagueSnapshot = statsSnapshot
 			cmds = append(cmds, ui.SpinnerTick())
 			// Start fetching day 0 (today) first - results shown immediately when it completes
-			cmds = append(cmds, fetchStatsDayData(m.loadCtx, m.fotmobClient, m.useMockData, 0, fotmob.StatsDataDays))
+			cmds = append(cmds, fetchStatsDayData(m.loadCtx, m.fotmobClient, m.useMockData, 0, fotmob.StatsDataDays, statsSnapshot))
 		case 1: // Live Matches view - preload live matches progressively (parallel batches)
 			m.liveViewLoading = true
 			m.loading = true
 			m.liveBatchesLoaded = 0
-			totalLeagues := fotmob.TotalLeagues()
+			// Capture the normalized league snapshot once. Batch count and each
+			// batch's league IDs are derived from this snapshot instead of
+			// re-reading settings per batch.
+			liveSnapshot, snapshotErr := fotmob.CaptureActiveLeagues()
+			if snapshotErr != nil {
+				m.debugLog(fmt.Sprintf("live snapshot load failed, using fallback: %v", snapshotErr))
+			}
+			m.liveLeagueSnapshot = liveSnapshot
+			totalLeagues := len(liveSnapshot)
 			m.liveTotalBatches = (totalLeagues + LiveBatchSize - 1) / LiveBatchSize // Ceiling division
 			m.liveMatchesBuffer = nil                                               // Clear buffer
 			m.liveUpcomingBuffer = nil                                              // Clear upcoming buffer
@@ -105,7 +120,7 @@ func (m model) handleMainViewKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.liveMatchesList.SetItems([]list.Item{})
 			cmds = append(cmds, ui.SpinnerTick())
 			// Start fetching batch 0 (4 leagues in parallel) - results shown when batch completes
-			cmds = append(cmds, fetchLiveBatchData(m.loadCtx, m.fotmobClient, m.useMockData, 0))
+			cmds = append(cmds, fetchLiveBatchData(m.loadCtx, m.fotmobClient, m.useMockData, 0, liveSnapshot))
 		}
 
 		return m, tea.Batch(cmds...)
@@ -172,7 +187,13 @@ func (m model) handleStatsViewKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.loadCancel()
 	}
 	m.loadCtx, m.loadCancel = context.WithCancel(context.Background())
-	return m, tea.Batch(m.spinner.Tick, ui.SpinnerTick(), fetchStatsDayData(m.loadCtx, m.fotmobClient, m.useMockData, 0, fotmob.StatsDataDays))
+	// Fresh round, fresh fixed snapshot for every day of the fallback fetch.
+	statsSnapshot, snapshotErr := fotmob.CaptureActiveLeagues()
+	if snapshotErr != nil {
+		m.debugLog(fmt.Sprintf("stats fallback snapshot load failed, using fallback: %v", snapshotErr))
+	}
+	m.statsLeagueSnapshot = statsSnapshot
+	return m, tea.Batch(m.spinner.Tick, ui.SpinnerTick(), fetchStatsDayData(m.loadCtx, m.fotmobClient, m.useMockData, 0, fotmob.StatsDataDays, statsSnapshot))
 }
 
 // loadMatchDetails loads match details for the live matches view.
@@ -259,9 +280,13 @@ func (m model) handleSettingsViewKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.settingsState.PreviousRegion()
 			return m, nil
 		case "enter":
-			// Save settings and return to main menu
+			// Persist atomically first; only switch the query scope (leave
+			// the settings view) once the save succeeds. On failure stay here
+			// with every checkbox preserved so the user can retry.
 			if err := m.settingsState.Save(); err != nil {
 				m.debugLog(fmt.Sprintf("failed to save settings: %v", err))
+				m.settingsState.SaveError = err.Error()
+				return m, nil
 			}
 			m.settingsState = nil
 			m.currentView = viewMain

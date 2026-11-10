@@ -22,6 +22,11 @@ type SettingsState struct {
 	Regions       []string          // Available regions
 	CurrentRegion int               // Index of current region
 	HasChanges    bool              // Whether there are unsaved changes
+	// SaveError holds the last settings-persistence failure. Non-empty means
+	// the user's edits were NOT saved and the view must remain open with the
+	// checkboxes preserved. Cleared as soon as the user edits a selection or
+	// a subsequent save succeeds.
+	SaveError string
 }
 
 // NewSettingsState creates a new settings state with current saved preferences.
@@ -90,6 +95,7 @@ func (s *SettingsState) Toggle() {
 	if item, ok := s.List.SelectedItem().(LeagueListItem); ok {
 		s.Selected[item.League.ID] = !s.Selected[item.League.ID]
 		s.HasChanges = true
+		s.SaveError = "" // a new edit supersedes the previous failed-save banner
 		s.refreshListItems()
 	}
 }
@@ -216,8 +222,21 @@ func RenderSettingsView(width, height int, state *SettingsState, bannerType cons
 		extraPadding = 4 // Additional vertical spacing
 	)
 
+	// The save-error banner occupies a line only while a save failure is shown.
+	errorHeight := 0
+	var saveErrorLine string
+	if state.SaveError != "" {
+		errorHeight = 1
+		saveErrorLine = lipgloss.NewStyle().
+			Foreground(neonRed).
+			Bold(true).
+			Width(settingsBoxWidth).
+			Align(lipgloss.Center).
+			Render("Settings not saved: " + state.SaveError)
+	}
+
 	listWidth := settingsBoxWidth
-	listHeight := height - titleHeight - tabsHeight - infoHeight - helpHeight - extraPadding
+	listHeight := height - titleHeight - tabsHeight - infoHeight - helpHeight - extraPadding - errorHeight
 	listHeight = max(listHeight, 5)
 
 	// Update list dimensions
@@ -256,9 +275,9 @@ func RenderSettingsView(width, height int, state *SettingsState, bannerType cons
 	helpStyle := neonDimStyle.Width(settingsBoxWidth).Align(lipgloss.Center)
 	help := helpStyle.Render(helpText)
 
-	// Combine content (minimal, no borders)
-	content := lipgloss.JoinVertical(
-		lipgloss.Left,
+	// Vertical content blocks; the save-error block is empty (joins as "")
+	// when there is no failure, keeping the normal layout unchanged.
+	contentBlocks := []string{
 		statusBanner,
 		title,
 		"",
@@ -267,7 +286,16 @@ func RenderSettingsView(width, height int, state *SettingsState, bannerType cons
 		listContent,
 		"",
 		info,
-		help,
+	}
+	if saveErrorLine != "" {
+		contentBlocks = append(contentBlocks, saveErrorLine)
+	}
+	contentBlocks = append(contentBlocks, help)
+
+	// Combine content (minimal, no borders)
+	content := lipgloss.JoinVertical(
+		lipgloss.Left,
+		contentBlocks...,
 	)
 
 	// Center in the terminal

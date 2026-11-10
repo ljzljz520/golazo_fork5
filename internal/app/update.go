@@ -811,9 +811,11 @@ func (m model) handleLiveBatchData(msg liveBatchDataMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(cmds...)
 	}
 
-	// Otherwise, fetch next batch
+	// Otherwise, fetch next batch from the same fixed snapshot — never
+	// re-read settings here, so a preference change mid-round can't shift the
+	// remaining batches onto a different league set.
 	nextBatchIndex := msg.batchIndex + 1
-	cmds = append(cmds, fetchLiveBatchData(m.loadCtx, m.fotmobClient, m.useMockData, nextBatchIndex))
+	cmds = append(cmds, fetchLiveBatchData(m.loadCtx, m.fotmobClient, m.useMockData, nextBatchIndex, m.liveLeagueSnapshot))
 
 	return m, tea.Batch(cmds...)
 }
@@ -991,9 +993,10 @@ func (m model) handleStatsDayData(msg statsDayDataMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(cmds...)
 	}
 
-	// Otherwise, fetch next day
+	// Otherwise, fetch next day against the same fixed snapshot, so all days
+	// of this round aggregate exactly the same league set.
 	nextDayIndex := msg.dayIndex + 1
-	cmds = append(cmds, fetchStatsDayData(m.loadCtx, m.fotmobClient, m.useMockData, nextDayIndex, m.statsTotalDays))
+	cmds = append(cmds, fetchStatsDayData(m.loadCtx, m.fotmobClient, m.useMockData, nextDayIndex, m.statsTotalDays, m.statsLeagueSnapshot))
 
 	return m, tea.Batch(cmds...)
 }

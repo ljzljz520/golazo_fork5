@@ -200,10 +200,19 @@ func LoadSettings() (*Settings, error) {
 	return &settings, nil
 }
 
-// SaveSettings writes settings to the settings.yaml file.
+// SaveSettings writes settings to the settings.yaml file atomically.
+// The payload is marshaled to a temporary file in the same directory and
+// renamed into place, so readers never observe a half-written file and a
+// failed save leaves the previous settings untouched.
 func SaveSettings(settings *Settings) error {
 	path, err := SettingsPath()
 	if err != nil {
+		return err
+	}
+
+	// Make sure the config directory exists (ConfigDir normally creates it,
+	// but do not rely on that when the directory was removed out from under us).
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return err
 	}
 
@@ -212,7 +221,24 @@ func SaveSettings(settings *Settings) error {
 		return err
 	}
 
-	return os.WriteFile(path, data, 0644)
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".settings.yaml.tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer func() { _ = os.Remove(tmpPath) }() // no-op once the rename succeeds
+
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+
+	// os.Rename is atomic on POSIX and replaces the destination on Windows
+	// (Go uses MoveFileEx with replace semantics).
+	return os.Rename(tmpPath, path)
 }
 
 // DefaultLeagueIDs contains the default leagues used when no selection is made.
@@ -224,16 +250,56 @@ var DefaultLeagueIDs = []int{
 	77, // FIFA World Cup
 }
 
-// ActiveLeagueIDs returns the league IDs that should be used for API calls.
-// If no leagues are selected in settings, returns the default leagues (not all).
-func ActiveLeagueIDs() []int {
-	settings, err := LoadSettings()
-	if err != nil || len(settings.SelectedLeagues) == 0 {
-		// Return default leagues for efficient API usage
-		return DefaultLeagueIDs
+// NormalizeLeagueIDs canonicalizes a league selection into the stable snapshot
+// used for an entire query round:
+//   - an empty selection falls back to DefaultLeagueIDs;
+//   - duplicate IDs are collapsed;
+//   - IDs are sorted so identical selections always produce identical
+//     snapshots (and therefore identical cache keys), regardless of the order
+//     in which the user toggled them.
+//
+// The returned slice is always a fresh copy that callers may retain safely.
+func NormalizeLeagueIDs(ids []int) []int {
+	if len(ids) == 0 {
+		fallback := append([]int(nil), DefaultLeagueIDs...)
+		slices.Sort(fallback)
+		return fallback
 	}
 
-	return settings.SelectedLeagues
+	seen := make(map[int]struct{}, len(ids))
+	normalized := make([]int, 0, len(ids))
+	for _, id := range ids {
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		normalized = append(normalized, id)
+	}
+	slices.Sort(normalized)
+	return normalized
+}
+
+// LoadActiveLeagueIDs loads the current settings once and returns the
+// normalized league snapshot to use for a query round. Callers that fan work
+// out into batches must call this once and thread the returned snapshot
+// through every batch instead of re-reading settings per batch.
+// Load errors are returned to the caller; use ActiveLeagueIDs for the
+// default-fallback convenience path.
+func LoadActiveLeagueIDs() ([]int, error) {
+	settings, err := LoadSettings()
+	if err != nil {
+		return NormalizeLeagueIDs(nil), err
+	}
+	return NormalizeLeagueIDs(settings.SelectedLeagues), nil
+}
+
+// ActiveLeagueIDs returns the league IDs that should be used for API calls.
+// If no leagues are selected in settings (or settings cannot be loaded),
+// returns the default leagues (not all). The result is normalized: sorted,
+// deduplicated, and safe to retain as a per-query snapshot.
+func ActiveLeagueIDs() []int {
+	ids, _ := LoadActiveLeagueIDs()
+	return ids
 }
 
 // AllLeagueIDs returns all supported league IDs (used as fallback).
